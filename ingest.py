@@ -1,94 +1,237 @@
-"""Ingesta: PDFs en data/ → chunks con metadatos → embeddings → ChromaDB persistente.
+"""build_chunks.py
+
+Recorre una carpeta de PDFs con documentación técnica (formato tipo StatsBomb API docs:
+título + secciones con encabezados + tablas de especificación + bloques JSON de ejemplo)
+y genera UN chunk por archivo, preservando título, tablas y texto de contexto.
 
 Uso:
-    python ingest.py --dry-run      # extrae y genera chunks SIN calcular embeddings → revisa chunks_preview.jsonl
-    python ingest.py                # indexa en ChromaDB
-    python ingest.py --reset        # borra la colección y reindexa todo (p. ej. si cambiaste el chunking, o modelo de embedding)
+    python build_chunks.py --input-dir data/ --output-file chunks.jsonl
+    python build_chunks.py --input-dir data/ --output-file chunks.jsonl --log-file build_chunks.log
 
-Tú decides:
-  - cómo extraer el texto (pymupdf4llm, pypdf, …) y cómo limpiarlo,
-  - cómo crear los chunks (por página, por encabezado, por tamaño, con overlap...),
-  - qué metadatos guardar (mínimo: source, page, doc_type + uno propio de tu dominio).
-
-Lo que YA está hecho en rag_agent/rag_core.py (léelo antes de empezar):
-  - get_collection(): colección persistente de ChromaDB en ./chroma_db, con distancia coseno y
-    el modelo de embeddings ya configurado (multilingual-e5-small, igual que en el Lab 5).
-    Chroma calcula los embeddings solo: collection.add(documents=...) y collection.query(query_texts=...).
+Cada línea del .jsonl de salida es un chunk:
+    {
+      "chunk_id": "chunk_1",
+      "source_file": "API 360 Frames v2.0.0.pdf",
+      "title": "...",
+      "tables": [{"headers": [...], "rows": [[...], ...]}, ...],
+      "text": "...",
+      "raw_markdown": "..."
+    }
 """
+
+from __future__ import annotations
 
 import argparse
 import json
+import logging
+import re
 from pathlib import Path
 
-from rag_agent.rag_core import PROJECT_DIR, get_collection
-
-DATA_DIR = PROJECT_DIR / "data"
-BATCH = 50  # chunks por collection.add
+logger = logging.getLogger("build_chunks")
 
 
-def extract_pages(pdf_path: Path) -> list[dict]:
-    """Extrae el texto de un PDF, una entrada por página: [{"page": 1, "text": "..."}, ...].
+# --------------------------------------------------------------------------- #
+# Extracción de markdown (con fallback a pypdf si pymupdf4llm falla)
+# --------------------------------------------------------------------------- #
 
-    Problemas típicos de los PDFs que debes resolver (o justificar por qué no importan):
-      - líneas cortas: cada renglón visual es una línea → los párrafos quedan partidos,
-      - encabezados y pies de página que se repiten en cada hoja,
-      - como hacer chunking de tablas
+def extract_markdown(pdf_path: Path) -> str:
+    """Devuelve el contenido del PDF en Markdown.
+
+    Intenta pymupdf4llm (preserva encabezados y tablas nativamente). Si falla
+    (PDF corrupto, dependencia rota, etc.) cae a pypdf, extrayendo texto plano
+    por página y devolviéndolo como markdown "pobre" (sin tablas estructuradas),
+    para que el resto del pipeline no se detenga.
     """
-    raise NotImplementedError
+    try:
+        import pymupdf4llm
+
+        md = pymupdf4llm.to_markdown(str(pdf_path))
+        if not md or not md.strip():
+            raise ValueError("pymupdf4llm devolvió contenido vacío")
+        return md
+    except Exception as e:  # noqa: BLE001 - queremos capturar cualquier fallo de extracción
+        logger.warning(
+            "pymupdf4llm falló en %s (%s). Usando fallback con pypdf (sin tablas).",
+            pdf_path.name,
+            e,
+        )
+        return _extract_with_pypdf(pdf_path)
 
 
-def build_chunks(pdf_path: Path) -> list[dict]:
-    """Convierte un PDF en una lista de chunks listos para indexar.
+def _extract_with_pypdf(pdf_path: Path) -> str:
+    from pypdf import PdfReader
 
-    Cada chunk debe ser: {"id": str único y DETERMINISTA,
-                          "text": str,
-                          "metadata": {"source": str, "page": int, "doc_type": str, ...}}
+    try:
+        reader = PdfReader(str(pdf_path))
+    except Exception as e:  # noqa: BLE001
+        logger.error("No se pudo abrir %s con pypdf: %s", pdf_path.name, e)
+        return ""
 
-    Pistas:
-      - multilingual-e5-small solo lee los primeros 512 tokens (~300 palabras): lo que sobre
-        de un chunk más largo se ignora sin avisar.
-      - un id determinista (p. ej. archivo-página-número) permite reanudar la indexación sin duplicar.
-      - los valores de metadata no pueden ser None (usa "" o 0).
+    pages_text = []
+    for i, page in enumerate(reader.pages):
+        try:
+            text = page.extract_text() or ""
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Página %d de %s sin texto extraíble: %s", i + 1, pdf_path.name, e)
+            text = ""
+        if text.strip():
+            pages_text.append(text)
+        else:
+            logger.warning("Página %d de %s vino vacía.", i + 1, pdf_path.name)
+
+    return "\n\n".join(pages_text)
+
+
+# --------------------------------------------------------------------------- #
+# Parsing de markdown: título, tablas, texto de contexto
+# --------------------------------------------------------------------------- #
+
+_TABLE_ROW_RE = re.compile(r"^\s*\|(.+)\|\s*$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
+
+
+def extract_title(markdown: str, fallback: str) -> str:
+    """Primera línea no vacía y no-tabla del markdown, limpiando símbolos '#'."""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _TABLE_ROW_RE.match(stripped):
+            continue
+        return re.sub(r"^#+\s*", "", stripped).strip()
+    logger.warning("No se encontró título extraíble; usando nombre de archivo como fallback.")
+    return fallback
+
+
+def _split_row(line: str) -> list[str]:
+    inner = line.strip()
+    inner = inner[1:] if inner.startswith("|") else inner
+    inner = inner[:-1] if inner.endswith("|") else inner
+    return [cell.strip() for cell in inner.split("|")]
+
+
+def extract_tables_and_text(markdown: str) -> tuple[list[dict], str]:
+    """Recorre el markdown línea por línea, extrayendo tablas y dejando el resto como texto.
+
+    Reconoce el patrón estándar de tabla markdown:
+        | Header1 | Header2 | ...
+        | ------- | ------- | ...
+        | val1    | val2    | ...
+    Filas mal formadas (número de celdas distinto al header) se registran como
+    advertencia y se omiten, sin detener el proceso.
     """
-    raise NotImplementedError
- 
+    lines = markdown.splitlines()
+    tables: list[dict] = []
+    text_lines: list[str] = []
 
-def index(chunks: list[dict], collection) -> None:
-    """Agrega los chunks a la colección (Chroma calcula los embeddings).
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        is_header = _TABLE_ROW_RE.match(line)
+        is_next_sep = (i + 1 < n) and _TABLE_SEP_RE.match(lines[i + 1] or "") and "|" in (lines[i + 1] or "")
 
-    Requisitos:
-      - agrega por lotes de BATCH chunks y muestra el avance (indexar tarda unos minutos),
-      - omite los chunks cuyo id ya está en la colección, para que volver a correr el script
-        después de un error continúe donde se quedó.
-    Usa collection.add(ids=..., documents=..., metadatas=...).
-    """
-    raise NotImplementedError
+        if is_header and is_next_sep:
+            headers = _split_row(line)
+            rows: list[list[str]] = []
+            j = i + 2
+            while j < n and _TABLE_ROW_RE.match(lines[j]):
+                row = _split_row(lines[j])
+                if len(row) != len(headers):
+                    logger.warning(
+                        "Fila de tabla mal formada (esperaba %d columnas, encontró %d): %r",
+                        len(headers),
+                        len(row),
+                        lines[j],
+                    )
+                else:
+                    rows.append(row)
+                j += 1
+            tables.append({"headers": headers, "rows": rows})
+            i = j
+            continue
+
+        text_lines.append(line)
+        i += 1
+
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(text_lines)).strip()
+    return tables, text
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true", help="no calcula embeddings")
-    ap.add_argument("--reset", action="store_true", help="borra la colección antes de indexar")
+# --------------------------------------------------------------------------- #
+# Construcción de un chunk por PDF
+# --------------------------------------------------------------------------- #
+
+def build_chunk(pdf_path: Path, chunk_index: int) -> dict:
+    logger.info("Procesando %s -> chunk_%d", pdf_path.name, chunk_index)
+    markdown = extract_markdown(pdf_path)
+
+    if not markdown.strip():
+        logger.error("Sin contenido extraíble en %s; se genera chunk vacío.", pdf_path.name)
+
+    title = extract_title(markdown, fallback=pdf_path.stem)
+    tables, text = extract_tables_and_text(markdown)
+
+    return {
+        "chunk_id": f"chunk_{chunk_index}",
+        "source_file": pdf_path.name,
+        "title": title,
+        "tables": tables,
+        "text": text,
+        "raw_markdown": markdown,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+
+def setup_logging(log_file: str | None) -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=handlers,
+    )
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input-dir", default="data", help="Carpeta con los PDFs (default: data/)")
+    ap.add_argument("--output-file", default="chunks.jsonl", help="Archivo .jsonl de salida")
+    ap.add_argument("--log-file", default=None, help="Archivo opcional para guardar el log")
     args = ap.parse_args()
 
-    pdfs = sorted(DATA_DIR.rglob("*.pdf"))
-    chunks = [c for pdf in pdfs for c in build_chunks(pdf)]
-    print(f"{len(chunks)} chunks de {len(pdfs)} PDFs")
+    setup_logging(args.log_file)
 
-    if args.dry_run:
-        with (PROJECT_DIR / "chunks_preview.jsonl").open("w", encoding="utf-8") as f:
-            for c in chunks:
-                f.write(json.dumps(c, ensure_ascii=False) + "\n")
-        print("Dry run: revisa chunks_preview.jsonl. No se calcularon embeddings.")
-        return
+    input_dir = Path(args.input_dir)
+    output_file = Path(args.output_file)
 
-    if args.reset:
-        collection = get_collection()
-        ids = collection.get(include=[])["ids"]
-        if ids:
-            collection.delete(ids=ids)
-        print("Colección vaciada.")
-    index(chunks, get_collection())
+    if not input_dir.exists():
+        logger.error("La carpeta de entrada no existe: %s", input_dir)
+        raise SystemExit(1)
+
+    pdfs = sorted(input_dir.rglob("*.pdf"))
+    if not pdfs:
+        logger.warning("No se encontraron PDFs en %s", input_dir)
+
+    chunks = []
+    for idx, pdf_path in enumerate(pdfs, start=1):
+        try:
+            chunk = build_chunk(pdf_path, idx)
+            chunks.append(chunk)
+        except Exception as e:  # noqa: BLE001 - un PDF corrupto no debe detener el resto
+            logger.error("Fallo irrecuperable procesando %s: %s", pdf_path.name, e)
+            continue
+
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    with output_file.open("w", encoding="utf-8") as f:
+        for chunk in chunks:
+            f.write(json.dumps(chunk, ensure_ascii=False) + "\n")
+
+    logger.info("%d chunks escritos en %s (de %d PDFs)", len(chunks), output_file, len(pdfs))
 
 
 if __name__ == "__main__":
