@@ -1,0 +1,5 @@
+google-adk
+chromadb
+sentence-transformers   # instala torch (en Mac y Windows ya es la versión solo-CPU, ~125 MB)
+pymupdf4llm
+python-dotenv

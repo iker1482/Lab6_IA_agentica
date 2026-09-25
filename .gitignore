@@ -1,0 +1,6 @@
+.env
+chroma_db/
+chunks_preview.jsonl
+.venv/
+__pycache__/
+.DS_Store
